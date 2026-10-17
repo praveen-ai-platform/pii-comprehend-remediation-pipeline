@@ -1,119 +1,115 @@
-# PII Comprehend Remediation Pipeline
+# PII Detection & Remediation Pipeline (PoC)
 
-Detect sensitive spans with **Amazon Comprehend DetectPiiEntities** and redact
-logs before writing sanitized batches to S3. Python handles validation and
-redaction; AWS Lambda processes direct records or CloudWatch Logs subscriptions;
-Terraform defines the AWS resources. An explicit regex backend supports offline
-demonstrations using synthetic data only.
+A personal proof of concept exploring how personally identifiable information
+(PII) can be detected and redacted from log messages before those messages reach
+downstream storage and observability workflows.
 
-## Architecture
+The solution combines **Python, AWS Lambda, Amazon Comprehend, CloudWatch Logs,
+and Amazon S3**. Synthetic log records illustrate the processing flow, while
+Terraform describes the supporting AWS infrastructure.
+
+## Project objective
+
+Reduce the exposure of sensitive information in downstream log data while
+preserving the operational context needed for troubleshooting. The pipeline
+identifies sensitive spans, replaces them with redaction markers, and produces
+sanitized records with detection metadata.
+
+## Solution architecture
 
 ```mermaid
 flowchart LR
-  Logs[CloudWatch Logs or direct records] --> Validate[Decode and validate bounded batch]
-  Validate --> Comprehend[Amazon Comprehend PII detection]
-  Comprehend --> Mask[Merge spans and redact]
-  Mask --> S3[Encrypted private S3 bucket]
-  Lambda[Lambda errors] --> Alarm[CloudWatch alarm]
+    CW[Amazon CloudWatch Logs] --> L[AWS Lambda]
+    INPUT[Direct log records] --> L
+    L --> V[Decode and validate records]
+    V --> C[Amazon Comprehend PII detection]
+    C --> R[Merge overlapping spans and redact]
+    R --> S3[Sanitized output in encrypted Amazon S3]
+    L -. processing errors .-> ALARM[Amazon CloudWatch alarm]
 ```
 
-Original messages and detected raw values are never returned, written to the
-sanitized destination, or intentionally logged. Findings contain only type,
-character offsets, and confidence. All detections are redacted, including
-low-confidence ones. Overlapping spans are merged before masking.
+## How the solution works
 
-## Offline demo and tests
+1. **Log input:** Lambda receives a batch of log records directly or through a
+   CloudWatch Logs subscription.
+2. **Validation:** The pipeline decodes the incoming event and checks the record
+   structure and supported payload limits.
+3. **PII detection:** Amazon Comprehend identifies sensitive entities and returns
+   their types, character positions, and confidence scores.
+4. **Remediation:** Python merges overlapping or adjacent spans and replaces the
+   detected values with `[REDACTED]` markers.
+5. **Sanitized output:** The pipeline produces redacted messages and metadata
+   describing the findings. Original messages and detected raw values are omitted
+   from the output structure.
+6. **Storage:** When the S3 destination is configured, sanitized batches are
+   written to an encrypted private bucket.
+7. **Failure monitoring:** A CloudWatch alarm monitors Lambda errors. Detection
+   or validation failures stop the batch before sanitized output is emitted.
 
-Use Python 3.13 or 3.14:
+## Illustrative redaction
 
-```sh
-python -m venv .venv
-# Windows PowerShell: .venv\Scripts\Activate.ps1
-# macOS/Linux: source .venv/bin/activate
-python -m pip install -r requirements-dev.lock
-python -m src.local_run
-python -m unittest discover -s tests -v
+Synthetic input:
+
+```text
+Customer demo@example.com called +12025550123 about a payment issue.
 ```
 
-The demo calls the regex detector directly and makes no AWS requests. Regex
-patterns are limited demonstrations and can miss PII or over-redact numbers.
-They are **not** a Comprehend replacement or a detection-accuracy benchmark.
+Illustrative sanitized output:
 
-## Handler contract
-
-Handler: `src.lambda_handler.lambda_handler`.
-
-Direct input:
-
-```json
-{"records":[{"message":"Synthetic email demo@example.com"}]}
+```text
+Customer [REDACTED] called [REDACTED] about a payment issue.
 ```
 
-The handler also accepts the standard CloudWatch `awslogs.data` base64/gzip
-envelope and ignores control messages. It accepts up to 1,000 records, each
-limited to 100,000 UTF-8 bytes. The compressed-envelope limit is 2 MB, and expanded
-CloudWatch JSON is capped at 4 MB. Unsupported or oversized batches fail rather
-than forwarding unchecked content. Additional record metadata is dropped.
+Finding metadata retains the entity type, source character offsets, and detection
+confidence. It excludes the detected value itself.
 
-Processing is batch-atomic before output: any detection or validation failure
-raises a generic error and no partial sanitized batch is emitted. There is no
-fallback from a failed Comprehend call to regex. Downstream S3 failures also fail
-the invocation so the event source can apply its retry behavior.
+## Key capabilities
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PII_BACKEND` | `comprehend` | `regex` allowed only outside production |
-| `ENVIRONMENT` | `production` | Prevents accidental production regex use |
-| `PII_LANGUAGE` | `en` | `en` or `es` |
-| `SANITIZED_BUCKET` | unset | Write sanitized JSON to S3; otherwise return sanitized records |
-| `AWS_REGION` | AWS runtime configuration | Comprehend/S3 client region |
+- Comprehend-based detection integrated with a Python Lambda handler.
+- Support for direct records and CloudWatch Logs event envelopes.
+- Overlapping-span redaction without duplicating sensitive text.
+- Redaction of every returned detection, including low-confidence findings.
+- Batch validation and failure handling that prevent partial batch output when
+  detection or validation fails.
+- Private S3 output with encryption and TLS enforcement in the infrastructure
+  configuration.
+- Infrastructure configuration for IAM permissions, log retention, storage
+  retention, concurrency limits, and error monitoring.
 
-CloudWatch delivery is at least once; repeated deliveries may create duplicate
-sanitized S3 objects. S3 keys use random IDs and contain no record content. Each
-batch performs one Comprehend request per nonempty record, sequentially, with
-bounded SDK retries and connection/read timeouts. Size batches and Lambda timeout
-for measured throughput and account quotas. This implementation has not been
-load-tested against AWS; review large subscription batches before deployment.
+## PoC scope
 
-## Terraform deployment
+Synthetic messages provide the demonstration data. The main AWS workflow uses
+Amazon Comprehend; a separate offline regex demonstration supports local
+inspection of the redaction logic.
 
-The deployment package targets **Lambda Python 3.13 x86_64**, including Linux
-wheels even when built from Windows. Building needs network access to PyPI.
+Redaction depends on the entities detected. Processing a CloudWatch log stream
+creates sanitized downstream records; it does not alter the original source
+logs. Automated remediation in this project means text redaction, not changes to
+applications, customer records, or source systems.
 
-```sh
-python scripts/package_lambda.py
-terraform -chdir=terraform init
-terraform -chdir=terraform validate
-terraform -chdir=terraform plan -var='source_log_group_name=/your/existing/source'
-# Review the plan before applying in your AWS account.
-```
+## Technology stack
 
-Terraform provisions a Lambda execution role, scoped log-write and S3-write IAM
-permissions, Comprehend detection permission, private S3 storage with encryption
-and TLS enforcement, a 30-day object expiry policy, a 14-day Lambda log retention
-policy, concurrency limits, and a Lambda error alarm. Optional existing SNS topic
-ARNs can receive alarm actions. A source subscription is created only when
-`source_log_group_name` is supplied. The source must not be the processing
-Lambda's own log group, which would create a recursive subscription.
+| Component | Role |
+|---|---|
+| Python | Input validation, span handling, and redaction |
+| AWS Lambda | Event-driven log processing |
+| Amazon Comprehend | PII entity detection |
+| Amazon CloudWatch Logs | Log-event source and function logging |
+| Amazon S3 | Encrypted storage of sanitized output |
+| AWS IAM | Scoped access to the processing resources |
+| Amazon CloudWatch alarms | Processing-error monitoring |
+| Terraform | AWS infrastructure configuration |
 
-`comprehend:DetectPiiEntities` requires `Resource: "*"` because that action does
-not support resource-level restrictions; other permissions are scoped. The
-bucket is not force-deleted. Use an encrypted, access-controlled remote Terraform
-state backend for real deployments. No AWS resources are deployed by CI.
+## Repository references
 
-## Privacy boundary and limitations
+- [Architecture and workflow](docs/architecture.md): processing sequence and component responsibilities.
+- [Development reference](docs/development.md): local validation and AWS deployment details.
+- `src/pii_detector.py`: Comprehend integration and span redaction.
+- `src/lambda_handler.py`: event processing and sanitized output handling.
+- `terraform/`: AWS infrastructure configuration.
 
-Comprehend receives the original text inside your configured AWS region.
-Redaction is detection-dependent and cannot guarantee that every sensitive value
-is found. Source CloudWatch logs already contain the original messages; this
-pipeline does not erase or sanitize that source. Restrict source access and
-retention. Review downstream consumers and never enable payload debug logging.
+## Validation
 
-No raw-event dead-letter destination is configured because it would retain PII.
-CloudWatch retries and retention are finite; this project does not promise
-lossless delivery. Error alarms require an operator response and a documented
-recovery procedure. Synthetic tests verify span handling and the SDK request
-contract; production detection accuracy and AWS throughput remain unmeasured.
-
-References: [Comprehend API limits](https://docs.aws.amazon.com/comprehend/latest/APIReference/API_DetectPiiEntities.html),
-[PII analysis](https://docs.aws.amazon.com/comprehend/latest/dg/realtime-pii-api.html).
+Automated tests cover redaction, overlapping spans, Unicode offsets, CloudWatch
+events, AWS SDK request contracts, failure handling, and sanitized S3 output.
+CI also checks dependencies, validates Terraform, and builds the Lambda package.
